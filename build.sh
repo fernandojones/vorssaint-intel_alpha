@@ -10,6 +10,12 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# Set thread cap for compilation to prevent CI resource exhaustion under Rosetta 2
+COMPILATION_JOBS="$(sysctl -n hw.logicalcpu)"
+if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
+    COMPILATION_JOBS=4
+fi
+
 # The icon catalog and the bundle are staged in temp dirs; sweep both however
 # the script ends.
 ICON_TMP=""
@@ -251,6 +257,26 @@ discard_test_preferences() {
     return 1
 }
 
+run_with_timeout() {
+    local secs="$1"
+    shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "${secs}s" "$@"
+    elif command -v gtimeout >/dev/null 2>&1; then
+        gtimeout "${secs}s" "$@"
+    else
+        "$@" &
+        local pid=$!
+        ( sleep "$secs"; kill -9 $pid 2>/dev/null ) &
+        local watcher=$!
+        wait $pid 2>/dev/null
+        local res=$?
+        kill -9 $watcher 2>/dev/null || true
+        wait $watcher 2>/dev/null || true
+        return $res
+    fi
+}
+
 # Standalone automated tests: pure contracts plus isolated disk, subprocess,
 # keyboard-data and media fixtures. No application windows or device capture.
 if (( TEST )); then
@@ -476,12 +502,12 @@ if (( TEST )); then
     TEST_OUTPUT_FILE_MAP="$TEST_OBJECT_DIR/output-file-map.json"
     write_swift_output_file_map "$TEST_OUTPUT_FILE_MAP" "$TEST_OBJECT_DIR" "${TEST_SOURCES[@]}"
     echo "▸ Building & running tests against $(basename "$SDK")…"
-    swiftc -Onone -incremental -enable-batch-mode -j "$(sysctl -n hw.logicalcpu)" \
+    swiftc -Onone -incremental -enable-batch-mode -j "$COMPILATION_JOBS" \
         -module-name VorssaintTests -output-file-map "$TEST_OUTPUT_FILE_MAP" \
         -target "$TARGET" -sdk "$SDK" "${SDK_COMPAT_FLAGS[@]}" \
         "${VM_STATISTICS_COMPAT_FLAGS[@]}" "${TEST_SOURCES[@]}" -o build/metrics-tests
     test_status=0
-    ./build/metrics-tests "${TEST_ARGS[@]}" || test_status=$?
+    run_with_timeout 180 ./build/metrics-tests "${TEST_ARGS[@]}" \vert{}\vert{} test_status=$?
     if (( ${#TEST_ARGS} == 0 )); then
         ./Tests/PreferenceCleanupTests.sh || test_status=1
     fi
@@ -496,7 +522,7 @@ if (( DEV )); then
     mkdir -p build "$APP_OBJECT_DIR"
     APP_OUTPUT_FILE_MAP="$APP_OBJECT_DIR/output-file-map.json"
     write_swift_output_file_map "$APP_OUTPUT_FILE_MAP" "$APP_OBJECT_DIR" "${APP_SOURCES[@]}"
-    swiftc "${APP_OPTIMIZATION_FLAGS[@]}" -incremental -j "$(sysctl -n hw.logicalcpu)" \
+    swiftc "${APP_OPTIMIZATION_FLAGS[@]}" -incremental -j "$COMPILATION_JOBS" \
         -output-file-map "$APP_OUTPUT_FILE_MAP" \
         -target "$TARGET" -sdk "$SDK" "${SDK_COMPAT_FLAGS[@]}" "${VM_STATISTICS_COMPAT_FLAGS[@]}" "${HID_EVENT_SYSTEM_FLAGS[@]}" \
         "${BUILD_VARIANT_FLAGS[@]}" \
@@ -604,7 +630,7 @@ if (( DEV )); then
     # testing, instead of unknowingly running a stale build. Dev-only; never shipped.
     SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
     [[ -n "$(git status --porcelain 2>/dev/null)" ]] && SHA="$SHA-dirty"
-    /usr/libexec/PlistBuddy -c "Add :VorssaintBuildCommit string '$SHA · $(date '+%Y-%m-%d %H:%M')'" "$STAGE/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c "Add :VorssaintBuildCommit string '$SHA · $(date '+\%Y-\%m-\%d \%H:\%M')'" "$STAGE/Contents/Info.plist"
     echo "  stamped dev build: $SHA"
 fi
 if [[ "$ARCH" == "arm64" ]]; then
@@ -804,7 +830,7 @@ if (( INSTALL )); then
     # Remove the pre-rename apps so two menu bar items never coexist. Same bundle
     # id, so macOS keeps the granted permissions for the new bundle.
     for legacy in "Vorss:Vorss" "Vorssaint Utils:VorssaintUtils"; do
-        name="${legacy%%:*}"; proc="${legacy##*:}"
+        name="${legacy\%\%:*}"; proc="${legacy##*:}"
         if [[ -d "/Applications/$name.app" ]]; then
             stop_process "$proc"
             rm -rf "/Applications/$name.app"
