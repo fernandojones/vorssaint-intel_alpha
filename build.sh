@@ -507,7 +507,7 @@ if (( TEST )); then
         -target "$TARGET" -sdk "$SDK" "${SDK_COMPAT_FLAGS[@]}" \
         "${VM_STATISTICS_COMPAT_FLAGS[@]}" "${TEST_SOURCES[@]}" -o build/metrics-tests
     test_status=0
-    run_with_timeout 180 ./build/metrics-tests "${TEST_ARGS[@]}" \vert{}\vert{} test_status=$?
+    run_with_timeout 180 ./build/metrics-tests "${TEST_ARGS[@]}" || test_status=$?
     if (( ${#TEST_ARGS} == 0 )); then
         ./Tests/PreferenceCleanupTests.sh || test_status=1
     fi
